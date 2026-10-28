@@ -1,0 +1,670 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Jelly Cloud</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #030716; overflow: hidden; overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+  canvas { position: fixed; inset: 0; display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+  canvas.dragging { cursor: grabbing; }
+  .ui {
+    position: fixed; left: 0; right: 0; bottom: calc(16px + env(safe-area-inset-bottom)); padding: 0 12px; display: flex; flex-direction: column;
+    align-items: center; gap: 10px; font: 13px/1.4 -apple-system, "PingFang TC", "Noto Sans TC", sans-serif;
+    color: rgba(190, 240, 230, .6); pointer-events: none; user-select: none;
+  }
+  .ui .btns { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; pointer-events: auto; touch-action: manipulation; }
+  .ui .hint { text-align: center; }
+  .ui button {
+    font: inherit; color: #c8fff2; background: rgba(80, 220, 200, .1);
+    border: 1px solid rgba(120, 240, 220, .3); border-radius: 999px; padding: 6px 14px; cursor: pointer;
+  }
+  .ui button:hover { background: rgba(80, 220, 200, .2); }
+  @media (pointer: coarse) {
+    .ui { gap: 8px; font-size: 14px; }
+    .ui button { min-height: 40px; min-width: 52px; padding: 8px 12px; }
+    .ui button:hover { background: rgba(80, 220, 200, .1); }
+  }
+  .ui button:active { transform: scale(.94); }
+  .ui button.on { background: rgba(80, 220, 200, .32); border-color: rgba(160, 255, 235, .7); }
+  #zzz { position: fixed; left: 0; top: 0; pointer-events: none; opacity: 0;
+    font: 700 22px/1 -apple-system, sans-serif; color: #bff8ee; text-shadow: 0 0 10px rgba(120, 255, 230, .8); }
+  #zzz span { position: absolute; animation: zfloat 2.4s ease-out infinite; opacity: 0; }
+  #zzz span:nth-child(2) { animation-delay: .8s; font-size: 26px; }
+  #zzz span:nth-child(3) { animation-delay: 1.6s; font-size: 32px; }
+  @keyframes zfloat { 0% { transform: translate(0, 0); opacity: 0; } 20% { opacity: 1; } 100% { transform: translate(30px, -60px); opacity: 0; } }
+  .err { position: fixed; inset: 0; display: grid; place-items: center; color: #9cc; font: 15px sans-serif; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="zzz"><span>z</span><span>z</span><span>Z</span></div>
+<div class="ui">
+  <div class="btns">
+    <button data-mood="neutral" class="on">平常</button>
+    <button data-mood="happy">開心</button>
+    <button data-mood="sleepy">想睡</button>
+    <button data-mood="angry">生氣</button>
+    <button data-mood="surprised">驚訝</button>
+  </div>
+  <div class="btns">
+    <button id="poke">戳一下</button>
+    <button id="jump">跳一下</button>
+    <button id="shake">搖一搖</button>
+  </div>
+  <div class="hint" id="hint">拖曳移動 · 點身體戳戳（連戳會生氣）· 雙擊或空白鍵跳躍 · 長按擠一擠 · 放著不管會睡著</div>
+</div>
+
+<script id="fs" type="x-shader/x-fragment">
+precision highp float;
+uniform vec2  uRes;
+uniform float uT;
+uniform vec4  uS[7];   // [0] = base slab anchor, [1..6] = lobes: center (xyz) + radius (w), local space
+uniform vec4  uB;      // body x, body y, squash, tilt
+uniform vec2  uLook;
+uniform float uBlink;
+uniform float uFocal;
+uniform vec4  uF1, uF2;
+uniform vec2  uF3;
+uniform vec3  uGrade;
+uniform float uWob;
+
+float smin(float a, float b, float k) { float h = clamp(.5 + .5 * (b - a) / k, 0., 1.); return mix(b, a, h) - k * h * (1. - h); }
+float smax(float a, float b, float k) { return -smin(-a, -b, k); }
+
+float hash(vec3 p) { p = fract(p * .3183099 + .1); p *= 17.; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+float noise(vec3 x) {
+  vec3 i = floor(x), f = fract(x); f = f * f * (3. - 2. * f);
+  return mix(mix(mix(hash(i), hash(i + vec3(1,0,0)), f.x), mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+             mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x), mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
+}
+
+vec3 toLocal(vec3 p) {
+  vec3 q = p - vec3(uB.x, uB.y, 0.);
+  float c = cos(uB.w), s = sin(uB.w);
+  q.xy = mat2(c, s, -s, c) * q.xy;
+  q.y /= uB.z;
+  q.xz *= sqrt(uB.z);
+  return q;
+}
+
+float sdLocal(vec3 q) {
+  // wide rounded slab gives the continuous flat bottom
+  vec3 r0 = q - uS[0].xyz; r0.z *= 1.2;
+  vec3 a = abs(r0) - vec3(.78, .22, .34);
+  float d = (length(max(a, 0.)) + min(max(a.x, max(a.y, a.z)), 0.) - .32) / 1.2;
+  for (int i = 1; i < 7; i++) {
+    vec3 r = q - uS[i].xyz; r.z *= 1.2;
+    d = smin(d, (length(r) - uS[i].w) / 1.2, i == 6 ? .35 : .15);
+  }
+  d = smax(d, .04 - q.y, .1);   // flat bottom resting on the floor
+  d += .016 * uWob * sin(q.x * 3. + uT * 1.7 * uWob) * sin(q.y * 2.6 - uT * 1.3 * uWob) * sin(q.z * 3. + uT);
+  return d;
+}
+
+float map(vec3 p) { return sdLocal(toLocal(p)) * min(uB.z, 1. / sqrt(uB.z)) * .9; }
+
+vec3 normal(vec3 p) {
+  vec2 e = vec2(.002, -.002);
+  return normalize(e.xyy * map(p + e.xyy) + e.yyx * map(p + e.yyx) + e.yxy * map(p + e.yxy) + e.xxx * map(p + e.xxx));
+}
+
+vec2 iSphere(vec3 ro, vec3 rd, vec3 c, float r) {
+  vec3 oc = ro - c; float b = dot(oc, rd), h = b * b - dot(oc, oc) + r * r;
+  if (h < 0.) return vec2(-1.);
+  h = sqrt(h); return vec2(-b - h, -b + h);
+}
+
+const vec3 BC = vec3(0., 1.05, 0.);   // bounding sphere center (local), radius 2.5
+
+float march(vec3 ro, vec3 rd) {
+  vec2 bb = iSphere(ro, rd, vec3(uB.x, uB.y, 0.) + BC, 2.5);
+  if (bb.y < 0.) return -1.;
+  float t = max(bb.x, 0.);
+  for (int i = 0; i < MARCH_STEPS; i++) {
+    float d = map(ro + rd * t);
+    if (d < .001) return t;
+    t += d;
+    if (t > bb.y) break;
+  }
+  return -1.;
+}
+
+// closest approach of a ray to the body: gives a naturally blurred reflection
+float marchMin(vec3 ro, vec3 rd) {
+  vec2 bb = iSphere(ro, rd, vec3(uB.x, uB.y, 0.) + BC, 2.5);
+  if (bb.y < 0.) return 9.;
+  float t = max(bb.x, 0.), m = 9.;
+  for (int i = 0; i < REFL_STEPS; i++) {
+    float d = map(ro + rd * t);
+    m = min(m, d);
+    if (d < .001) return 0.;
+    t += max(d, .03);
+    if (t > bb.y) break;
+  }
+  return m;
+}
+
+float wisp(vec3 q) {
+  vec3 w = q * vec3(.8, 1.2, .8) + vec3(0., -uT * .12, uT * .08);
+  float n = noise(w) + .25 * noise(w * 2.3 + 5.);
+  return pow(1. - abs(2. * n / 1.25 - 1.), 28.);
+}
+
+float gFace = 0.;   // face coverage of the last shade() call, keeps bloom off the eyes and mouth
+
+vec3 shade(vec3 p, vec3 rd) {
+  vec3 q = toLocal(p), n = normal(p), v = -rd;
+  float ndv = max(dot(n, v), 0.);
+
+  // body: even saturated teal, a touch lighter in the lower middle, darker up in the dome
+  vec3 col = vec3(.04, .62, .56);
+  col = mix(col, vec3(.02, .44, .46), smoothstep(1.1, 2.1, q.y));
+  col += vec3(.06, .42, .32) * exp(-length((q.xy - vec2(-.2, .6)) * vec2(.7, 1.)) * 1.4);
+  col *= .85 + .15 * ndv;
+
+  // faint large swirls inside
+  float wi = 0.;
+  for (int i = 0; i < 4; i++) wi += wisp(q - rd * (.12 + .18 * float(i)));
+  col += vec3(.35, .9, .8) * wi * .14;
+
+  // outer rim light: cyan-white all around, yellow-green on the right
+  float rim = pow(1. - ndv, 2.2);
+  float right = smoothstep(-.1, .8, n.x);
+  vec3 rimCol = mix(vec3(.55, 1., .92), vec3(1., 1., .5), right);
+  col += rimCol * rim * (1.4 + 1.2 * right);
+  col += vec3(.4, 1., .85) * pow(1. - ndv, 5.) * 2.2;   // hot thin edge for the bloom to pick up
+  col += vec3(.45, .55, .0) * smoothstep(.3, 1., n.x) * .55;   // right side warms up
+  col += vec3(.9, 1., .35) * pow(1. - ndv, 1.6) * smoothstep(.4, 1., n.x) * .6;
+  col += vec3(.0, .25, .3) * smoothstep(.3, 1., -n.x) * rim;     // left side cooler cyan
+  col += vec3(.2, .7, .6) * smoothstep(.2, -.6, n.y) * .4;       // light bouncing up from the floor
+
+  vec3 L = normalize(vec3(-.3, .7, .7));
+  col += vec3(.7, 1., .95) * pow(max(dot(reflect(-L, n), v), 0.), 40.) * .12;
+
+  col *= uGrade;   // mood color grade
+
+  // face. uF1 = lid height, lid slant (- = angry), eye scale, happy ^ arcs
+  //       uF2 = mouth half-length, mouth radius, open, smile curve (- = frown)
+  //       uF3 = closed sleeping eyes, blush
+  float front = smoothstep(.05, .35, q.z);
+  gFace = 0.;
+  for (int k = 0; k < 2; k++) {
+    float side = k == 0 ? -1. : 1.;
+    vec2 c = vec2(.33 * side, 1.1) + uLook * vec2(.07, .05);
+    vec2 e = (q.xy - c) / (.115 * uF1.z);
+    float ed = max(length(e) - 1., e.y - (uF1.x - uBlink * 1.9) + uF1.y * e.x * side);
+    float arc = max(abs(length(e - vec2(0., -.8)) - 1.) - .2, -e.y - .2);     // ^ happy
+    float shut = max(abs(length(e - vec2(0., 1.05)) - 1.) - .14, e.y - .25);   // sleeping curve
+    ed = mix(mix(ed, arc, uF1.w), shut, uF3.x);
+    float em = smoothstep(.12, -.12, ed) * front;
+    vec3 ec = vec3(.0, .01, .02) + vec3(.1, .2, .22) * smoothstep(.2, 1., -e.y) * .4;
+    col = mix(col, ec, em);
+    col += .35 * smoothstep(.2, .05, length(e - vec2(-.4, .05))) * em * (1. - uF1.w) * (1. - uF3.x);
+    gFace = max(gFace, em);
+
+    vec2 b = (q.xy - vec2(.58 * side, .9)) / vec2(.15, .08);
+    col = mix(col, vec3(1., .5, .58), smoothstep(1., 0., length(b)) * uF3.y * .6 * front);
+  }
+  vec2 m = q.xy - (vec2(0., .88) + uLook * vec2(.05, .04));
+  m.y -= uF2.w * (m.x * m.x * 4.5 - .015);
+  float msd = length(max(abs(m) - vec2(uF2.x, 0.), 0.)) - uF2.y;
+  float mm = smoothstep(.011, -.011, msd) * front;
+  vec3 mc = vec3(1., .42, .42);
+  mc *= 1. - .45 * smoothstep(.012, 0., abs(m.y + .004)) * (1. - uF2.z);
+  mc += vec3(.25, .15, .15) * smoothstep(.03, .0, abs(m.y - uF2.y * .55)) * smoothstep(.12, .05, abs(m.x)) * (1. - uF2.z);
+  mc *= .85 + .3 * smoothstep(-.07, .07, m.y);
+  float inner = smoothstep(.008, -.008, msd + .026) * uF2.z;
+  vec3 ic = mix(vec3(.3, .03, .07), vec3(.95, .45, .5), smoothstep(-.02, -uF2.y, m.y) * .6);   // tongue at the bottom
+  mc = mix(mc, ic, inner);
+  col = mix(col, mc, mm);
+  gFace = max(gFace, mm);
+
+  return col;
+}
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy - .5 * uRes) / uRes.y;
+  vec3 ro = vec3(0., 1.25, 7.6), ta = vec3(0., 1.08, 0.);
+  vec3 ww = normalize(ta - ro), uu = normalize(cross(ww, vec3(0, 1, 0))), vv = cross(uu, ww);
+  vec3 rd = normalize(uv.x * uu + uv.y * vv + uFocal * ww);
+
+  float r = length((uv - vec2(0., .02)) * vec2(.9, 1.));
+  vec3 col = mix(vec3(.05, .14, .38), vec3(.01, .03, .12), smoothstep(0., .9, r));
+
+  float t = march(ro, rd);
+  float tf = rd.y < 0. ? -ro.y / rd.y : 1e9;
+  bool hitBody = t > 0. && t < tf;
+
+  float face = 0.;
+  if (hitBody) {
+    col = shade(ro + rd * t, rd);
+    face = gFace;
+  } else if (rd.y < 0.) {
+    vec3 fp = ro + rd * tf;
+    vec3 fc = vec3(.03, .08, .22);
+    vec3 rr = reflect(rd, vec3(0, 1, 0));
+    float mdist = marchMin(fp, rr);
+    vec2 d = (fp.xz - vec2(uB.x, .2)) * vec2(.55, 1.6);
+    float under = exp(-dot(d, d) * 1.5);
+    float fade = exp(-max(fp.z - .45, 0.) * 1.3);
+    fc += vec3(.12, .85, .72) * exp(-mdist * 6.) * fade * .75 / (1. + uB.y * 2.);   // soft mirror glow
+    fc += vec3(.1, .6, .55) * under * .35 / (1. + uB.y * 2.);
+    col = mix(col, fc, smoothstep(-.02, .12, -rd.y));
+  }
+
+  vec3 oc = vec3(uB.x, uB.y, 0.) + BC - ro;
+  float dc = length(oc - rd * dot(oc, rd));
+  col += vec3(.1, .55, .55) * exp(-max(dc - 1.3, 0.) * 2.) * (hitBody ? .0 : .15);
+
+  col *= 1. - .3 * dot(uv * .8, uv * .8);
+  col = 1. - exp(-col * 1.45);
+  gl_FragColor = vec4(col, 1. - face);
+}
+</script>
+
+<!-- bloom: bright-pass/downsample, separable blur, composite -->
+<script id="fs-bright" type="x-shader/x-fragment">
+precision mediump float;
+uniform sampler2D uTex;
+uniform vec2 uRes, uTexel, uKnee;
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec3 c = (texture2D(uTex, uv + uTexel * vec2(-1., -1.)).rgb + texture2D(uTex, uv + uTexel * vec2(1., -1.)).rgb
+          + texture2D(uTex, uv + uTexel * vec2(-1., 1.)).rgb + texture2D(uTex, uv + uTexel * vec2(1., 1.)).rgb) * .25;
+  float l = max(c.r, max(c.g, c.b));
+  gl_FragColor = vec4(c * smoothstep(uKnee.x, uKnee.y, l), 1.);
+}
+</script>
+<script id="fs-blur" type="x-shader/x-fragment">
+precision mediump float;
+uniform sampler2D uTex;
+uniform vec2 uRes, uDir;
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec3 c = texture2D(uTex, uv).rgb * .227;
+  c += (texture2D(uTex, uv + uDir * 1.385).rgb + texture2D(uTex, uv - uDir * 1.385).rgb) * .316;
+  c += (texture2D(uTex, uv + uDir * 3.231).rgb + texture2D(uTex, uv - uDir * 3.231).rgb) * .070;
+  gl_FragColor = vec4(c, 1.);
+}
+</script>
+<script id="fs-comp" type="x-shader/x-fragment">
+precision mediump float;
+uniform sampler2D uScene, uB1, uB2;
+uniform vec2 uRes;
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec4 sc = texture2D(uScene, uv);
+  vec3 s = sc.rgb;
+  vec3 b = (texture2D(uB1, uv).rgb * .42 + texture2D(uB2, uv).rgb * .75) * mix(.08, 1., sc.a);
+  gl_FragColor = vec4(1. - (1. - s) * (1. - min(b, 1.)), 1.);   // screen blend
+}
+</script>
+
+<script>
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl', { antialias: false, alpha: false, powerPreference: 'high-performance' });
+const isTouch = matchMedia('(pointer: coarse)').matches;
+canvas.addEventListener('webglcontextlost', e => e.preventDefault());
+canvas.addEventListener('webglcontextrestored', () => location.reload());
+if (isTouch) document.getElementById('hint').textContent = '點一下戳戳 · 連戳會生氣 · 點兩下跳 · 長按擠擠 · 拖曳移動';
+// phones get fewer raymarch steps; the bloom hides the difference
+const DEFINES = isTouch ? '#define MARCH_STEPS 64\n#define REFL_STEPS 22\n' : '#define MARCH_STEPS 90\n#define REFL_STEPS 36\n';
+if (!gl) {
+  document.body.insertAdjacentHTML('beforeend', '<div class="err">這個瀏覽器不支援 WebGL</div>');
+  throw new Error('no webgl');
+}
+
+const vsSrc = 'attribute vec2 p; void main(){ gl_Position = vec4(p, 0., 1.); }';
+function compile(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const vs = compile(gl.VERTEX_SHADER, vsSrc);
+function program(id) {
+  const p = gl.createProgram();
+  gl.attachShader(p, vs);
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, DEFINES + document.getElementById(id).textContent));
+  gl.bindAttribLocation(p, 0, 'p');
+  gl.linkProgram(p);
+  const cache = {};
+  return { p, u: n => n in cache ? cache[n] : (cache[n] = gl.getUniformLocation(p, n)) };
+}
+const P = { scene: program('fs'), bright: program('fs-bright'), blur: program('fs-blur'), comp: program('fs-comp') };
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+function target(w, h) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  return { tex, fb, w, h };
+}
+function freeTarget(t) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fb); }
+function pass(prog, dst, setup) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dst ? dst.fb : null);
+  const w = dst ? dst.w : canvas.width, h = dst ? dst.h : canvas.height;
+  gl.viewport(0, 0, w, h);
+  gl.useProgram(prog.p);
+  gl.uniform2f(prog.u('uRes'), w, h);
+  setup(prog.u);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+function tex(unit, t, loc) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t.tex); gl.uniform1i(loc, unit); }
+
+// ---- sizing --------------------------------------------------------------
+let renderScale = isTouch ? .8 : 1, focal = 2.2, T = null;
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, isTouch ? 1.25 : 1.5) * renderScale;
+  canvas.width = Math.round(innerWidth * dpr);
+  canvas.height = Math.round(innerHeight * dpr);
+  const aspect = innerWidth / innerHeight;
+  focal = 2.5 * Math.min(1, aspect) * Math.min(1, .7 + .4 * aspect);   // tall phones zoom out a bit so the lobes stay on screen
+  if (T) Object.values(T).forEach(freeTarget);
+  const w = canvas.width, h = canvas.height;
+  const q = [Math.max(1, w >> 2), Math.max(1, h >> 2)], e = [Math.max(1, w >> 3), Math.max(1, h >> 3)];
+  T = { scene: target(w, h), a: target(...q), b: target(...q), c: target(...e), d: target(...e) };
+}
+addEventListener('resize', resize);
+resize();
+
+// ---- body + jelly physics -----------------------------------------------
+const base = [
+  [0, .5, 0, 0], [0, 1.22, 0, .86], [-.9, 1.06, 0, .45], [.9, 1.06, 0, .45],
+  [-1.0, .56, 0, .5], [1.0, .56, 0, .5], [0, .72, .05, .78],
+];
+const off = base.map(() => ({ x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 }));
+const body = { x: 0, vx: 0, tx: 0, y: 0, vy: 0, sy: 1, svy: 0, tilt: 0 };
+const look = { x: 0, y: 0, tx: 0, ty: 0 };
+let blink = 0, blinkT = -1, nextBlink = 2, squint = 0;
+const sArr = new Float32Array(28);
+
+// ---- expressions ----------------------------------------------------------
+// f1: lid, slant, eye scale, happy arcs · f2: mouth len, radius, open, smile · f3: asleep, blush
+// wiggle: squirm amount · breath: breathing speed · tremble: angry shiver · puff: body inflation
+const MOODS = {
+  neutral:   { f1: [.62, .06, 1, 0],    f2: [.095, .072, 0, 0],    f3: [0, 0],  grade: [1, 1, 1],          wiggle: 1,   breath: 1,   tremble: 0, puff: 0 },
+  happy:     { f1: [1.5, 0, 1, 1],      f2: [.075, .08, .9, 1.1],  f3: [0, .9], grade: [1.08, 1.12, 1.05], wiggle: 1.7, breath: 1.7, tremble: 0, puff: .03 },
+  sleepy:    { f1: [.2, 0, 1, 0],       f2: [.035, .045, 0, 0],    f3: [1, .3], grade: [.7, .8, .95],      wiggle: .45, breath: .55, tremble: 0, puff: 0 },
+  angry:     { f1: [.32, -.65, .95, 0], f2: [.08, .05, 0, -1.3],   f3: [0, 0],  grade: [1.35, .8, .75],    wiggle: 2,   breath: 2.4, tremble: 1, puff: .07 },
+  surprised: { f1: [1.5, 0, 1.3, 0],    f2: [0, .08, 1, 0],        f3: [0, 0],  grade: [1.06, 1.08, 1.1],  wiggle: 1.2, breath: 1,   tremble: 0, puff: .04 },
+};
+const cur = JSON.parse(JSON.stringify(MOODS.neutral));
+let mood = 'neutral', baseMood = 'neutral', moodTimer = 0, idle = 0, breathPhase = 0;
+const zzz = document.getElementById('zzz');
+
+function setMood(name, dur = 0) {
+  if (name === 'surprised' && mood !== 'surprised') { body.svy += 3.2; squint = 0; }
+  if (name === 'happy' && mood !== 'happy') hop(3.2);
+  mood = name; moodTimer = dur;
+  if (!dur) baseMood = name;
+  document.querySelectorAll('[data-mood]').forEach(b => b.classList.toggle('on', b.dataset.mood === baseMood));
+}
+function wake() {
+  idle = 0;
+  if (mood === 'sleepy') {
+    if (baseMood === 'sleepy') baseMood = 'neutral';
+    setMood('surprised', 1.3);
+  }
+}
+function lerpMood(dt) {
+  const k = 1 - Math.exp(-dt * 7), tgt = MOODS[mood];
+  for (const key in tgt) {
+    if (Array.isArray(tgt[key])) tgt[key].forEach((v, i) => cur[key][i] += (v - cur[key][i]) * k);
+    else cur[key] += (tgt[key] - cur[key]) * k;
+  }
+}
+
+function impulseBlobs(px, py, strength) {
+  off.forEach((o, i) => {
+    const dx = base[i][0] - px, dy = base[i][1] - py;
+    const dist = Math.hypot(dx, dy) + .001, f = Math.exp(-dist * 1.8) * strength;
+    o.vx += dx / dist * f; o.vy += dy / dist * f * .6; o.vz -= f * 1.2;
+  });
+}
+const pokeTimes = [];
+function poke(px = 0, py = .9) {
+  const was = mood;
+  wake();
+  body.svy -= 2.6;
+  impulseBlobs(px, py, 1.6);
+  squint = 1;
+  const now = performance.now();
+  pokeTimes.push(now);
+  while (pokeTimes.length && now - pokeTimes[0] > 2500) pokeTimes.shift();
+  if (pokeTimes.length >= 4) { setMood('angry', 4); pokeTimes.length = 0; }
+  else if (was === baseMood && was !== 'angry') setMood(Math.random() < .5 ? 'surprised' : 'happy', 1.2);
+}
+function hop(v) { if (body.y > .001) return; body.vy = v; body.svy += 1.5; }
+function jump() {
+  wake();
+  if (body.y > .001) return;
+  body.svy -= 1.5;
+  setTimeout(() => { body.vy = 6.2; body.svy += 3; }, 110);
+  if (mood !== 'angry') setMood('happy', 2.5);
+}
+function shake() {
+  wake();
+  let n = 0;
+  const id = setInterval(() => {
+    body.vx += (n % 2 ? -1 : 1) * 4.5;
+    if (++n > 5) clearInterval(id);
+  }, 90);
+  setMood('surprised', 1.6);
+}
+
+// idle actions so it keeps squirming on its own
+let nextAct = 3, wiggleT = 0;
+function idleAction() {
+  const acts = mood === 'happy' ? ['hop', 'wiggle', 'stretch'] : mood === 'angry' ? ['stomp', 'wiggle'] : ['stretch', 'squish', 'wiggle', 'lean'];
+  const a = acts[Math.floor(Math.random() * acts.length)];
+  if (a === 'stretch') body.svy += 2.8;
+  if (a === 'squish') body.svy -= 2.6;
+  if (a === 'wiggle') wiggleT = 1;
+  if (a === 'lean') body.vx += (Math.random() < .5 ? -1 : 1) * 2.2;
+  if (a === 'hop') hop(3.6);
+  if (a === 'stomp') { body.svy -= 3.5; impulseBlobs(0, .2, 1.2); }
+}
+
+function step(dt, t) {
+  lerpMood(dt);
+  const W = cur.wiggle;
+
+  // horizontal follow
+  const ax = (body.tx - body.x) * 30 - body.vx * 8;
+  body.vx += ax * dt; body.x += body.vx * dt;
+
+  // jump / gravity
+  if (body.y > 0 || body.vy > 0) {
+    body.vy -= 18 * dt; body.y += body.vy * dt;
+    if (body.y <= 0) {
+      body.y = 0; body.svy += body.vy * .32;
+      off.forEach(o => { o.vy += body.vy * .25; o.vx += (Math.random() - .5) * .8; });
+      body.vy = 0;
+    }
+  }
+
+  // squash & stretch (volume preserving in shader), breathing speed follows mood
+  breathPhase += dt * 1.8 * cur.breath;
+  const airStretch = body.y > 0 ? Math.min(Math.abs(body.vy) * .045, .28) : 0;
+  const st = 1 + (.03 + .03 * W) * Math.sin(breathPhase) + airStretch + cur.puff;
+  body.svy += ((st - body.sy) * 120 - body.svy * 6.5) * dt;
+  body.sy = Math.min(1.45, Math.max(.55, body.sy + body.svy * dt));
+
+  const sway = .05 * W * Math.sin(t * 1.3) + .02 * W * Math.sin(t * 2.7 + 1);
+  body.tilt += (Math.max(-.3, Math.min(.3, -body.vx * .07 + sway)) - body.tilt) * Math.min(1, dt * 10);
+
+  // per-blob jelly: a wave travels across the lobes, lobes swell and shrink, lag from body acceleration
+  if (wiggleT > 0) wiggleT = Math.max(0, wiggleT - dt);
+  off.forEach((o, i) => {
+    const [bx, h, , r] = base[i];
+    o.vx -= ax * dt * .03 * h;
+    const ph = t * 2.4 * (.6 + .4 * cur.breath) - bx * 1.6 + i * .9;
+    const tx = .05 * W * Math.sin(ph) + Math.sin(t * 22) * .12 * wiggleT * h;
+    const ty = .065 * W * Math.sin(ph * 1.15 + 1);
+    const tz = .035 * W * Math.sin(t * 1.9 + i * 1.3);
+    o.vx += ((tx - o.x) * 85 - o.vx * 4.5) * dt;
+    o.vy += ((ty - o.y) * 85 - o.vy * 4.5) * dt;
+    o.vz += ((tz - o.z) * 85 - o.vz * 4.5) * dt;
+    if (cur.tremble > .05) { o.vx += (Math.random() - .5) * 40 * cur.tremble * dt; o.vy += (Math.random() - .5) * 30 * cur.tremble * dt; }
+    o.x += o.vx * dt; o.y += o.vy * dt; o.z += o.vz * dt;
+    const pulse = 1 + .05 * W * Math.sin(t * 2.2 - bx * 1.4 + i * 1.7);
+    sArr.set([bx + o.x, h + o.y, base[i][2] + o.z, r * pulse], i * 4);
+  });
+
+  // mood timers, falling asleep when left alone
+  if (moodTimer > 0) { moodTimer -= dt; if (moodTimer <= 0) setMood(baseMood); }
+  idle += dt;
+  if (idle > 18 && mood === 'neutral' && baseMood === 'neutral') { mood = 'sleepy'; }
+  nextAct -= dt;
+  if (nextAct < 0 && mood !== 'sleepy' && !drag) { idleAction(); nextAct = 3 + Math.random() * 3; }
+
+  // eyes
+  look.x += (look.tx - look.x) * Math.min(1, dt * 6);
+  look.y += (look.ty - look.y) * Math.min(1, dt * 6);
+  nextBlink -= dt;
+  if (nextBlink < 0 && blinkT < 0) { blinkT = 0; nextBlink = 2 + Math.random() * 3.5; }
+  if (blinkT >= 0) { blinkT += dt / .18; if (blinkT >= 1) blinkT = -1; }
+  squint = Math.max(0, squint - dt * 2.5);
+  blink = Math.max(blinkT >= 0 ? Math.sin(Math.PI * blinkT) : 0, squint * .75) * (1 - cur.f1[3]) * (1 - cur.f3[0]);
+}
+
+// ---- input --------------------------------------------------------------
+function toWorld(e) {
+  const k = 7.6 / focal;
+  return {
+    x: (e.clientX - innerWidth / 2) / innerHeight * k,
+    y: 1.08 + (innerHeight / 2 - e.clientY) / innerHeight * k,
+  };
+}
+function toScreen(x, y) {
+  const k = 7.6 / focal;
+  return [innerWidth / 2 + x / k * innerHeight, innerHeight / 2 - (y - 1.08) / k * innerHeight];
+}
+function onBody(w) { return Math.abs(w.x - body.x) < 1.4 && w.y > body.y - .1 && w.y < body.y + 2.2; }
+let drag = null, lastTap = { t: 0, x: 0, y: 0 }, lookReset = 0;
+function lookAt(w) {
+  look.tx = Math.max(-1, Math.min(1, (w.x - body.x) / 2));
+  look.ty = Math.max(-1, Math.min(1, (w.y - body.y - 1.1) / 1.5));
+}
+canvas.addEventListener('pointerdown', e => {
+  const w = toWorld(e);
+  clearTimeout(lookReset);
+  lookAt(w);
+  if (!onBody(w)) return;
+  drag = { grab: w.x - body.tx, sx: e.clientX, sy: e.clientY, moved: false, held: 0, t0: performance.now() };
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* pointer already gone */ }
+  canvas.classList.add('dragging');
+});
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('pointermove', e => {
+  const w = toWorld(e);
+  if (e.pointerType === 'mouse' || drag) lookAt(w);
+  if (drag) {
+    const slop = e.pointerType === 'mouse' ? 4 : 10;
+    if (!drag.moved && performance.now() - drag.t0 < 450 && Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy) > slop) { drag.moved = true; wake(); }
+    body.tx = Math.max(-2.2, Math.min(2.2, w.x - drag.grab));
+  }
+});
+function release(e, cancelled) {
+  if (drag && !cancelled) {
+    drag.held = (performance.now() - drag.t0) / 1000;
+    if (drag.held >= .45 && !drag.moved) {
+      body.svy += 5; impulseBlobs(0, 1, 1.2);   // let go after a squeeze: boing
+      if (mood !== 'angry') setMood('happy', 2);
+    } else if (!drag.moved) {
+      // second tap within 350 ms near the first one is a double tap -> jump
+      const now = performance.now();
+      if (now - lastTap.t < 350 && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 40) { jump(); lastTap.t = 0; }
+      else {
+        const w = toWorld(e);
+        poke(w.x - body.x, w.y - body.y);
+        if (navigator.vibrate) navigator.vibrate(8);
+        lastTap = { t: now, x: e.clientX, y: e.clientY };
+      }
+    }
+  }
+  drag = null; canvas.classList.remove('dragging');
+  // fingers don't hover: let the eyes drift back to center after a touch
+  if (e.pointerType !== 'mouse') lookReset = setTimeout(() => { look.tx = 0; look.ty = 0; }, 900);
+}
+addEventListener('pointerup', e => release(e, false));
+addEventListener('pointercancel', e => release(e, true));
+addEventListener('keydown', e => { if (e.code === 'Space') { e.preventDefault(); jump(); } });
+document.getElementById('poke').onclick = () => poke((Math.random() - .5) * 1.2, .9 + Math.random() * .5);
+document.getElementById('jump').onclick = jump;
+document.getElementById('shake').onclick = shake;
+document.querySelectorAll('[data-mood]').forEach(b => b.onclick = () => { idle = 0; setMood(b.dataset.mood); });
+
+// ---- loop ---------------------------------------------------------------
+let last = performance.now(), perfFrames = 0, perfMs = 0, perfHold = 0;
+// adaptive resolution: drop when frames are slow, creep back up when there's headroom
+function adapt(ms) {
+  if (ms > 250) return;   // tab switch or hitch, not a real frame
+  perfMs += ms; perfFrames++;
+  if (perfFrames < 40) return;
+  const avg = perfMs / perfFrames; perfMs = 0; perfFrames = 0;
+  if (performance.now() < perfHold) return;
+  let next = renderScale;
+  if (avg > 22) next = Math.max(.45, renderScale * .8);
+  else if (avg < 14 && renderScale < 1) next = Math.min(1, renderScale * 1.1);
+  if (Math.abs(next - renderScale) > .01) { renderScale = next; resize(); perfHold = performance.now() + 1500; }
+}
+function frame(now) {
+  const ms = now - last; last = now;
+  const dt = Math.min(ms / 1000, 1 / 20);
+  const t = now / 1000;
+  adapt(ms);
+  // substeps keep the stiff springs stable at any frame rate
+  const n = Math.max(1, Math.ceil(dt * 180));
+  if (drag && !drag.moved) {
+    drag.held = (now - drag.t0) / 1000;
+    if (drag.held >= .45) { body.svy -= 9 * dt; squint = .6; wake(); }   // long press squeezes it
+  }
+  for (let i = 0; i < n; i++) step(dt / n, t);
+  const [zx, zy] = toScreen(body.x + .75, body.y + 2.05 * body.sy);
+  zzz.style.transform = `translate(${zx}px, ${zy}px)`;
+  zzz.style.opacity = cur.f3[0];
+  pass(P.scene, T.scene, u => {
+    gl.uniform1f(u('uT'), t);
+    gl.uniform4fv(u('uS'), sArr);
+    gl.uniform4f(u('uB'), body.x + Math.sin(t * 57) * .012 * cur.tremble, body.y, body.sy, body.tilt);
+    gl.uniform4fv(u('uF1'), cur.f1);
+    gl.uniform4fv(u('uF2'), cur.f2);
+    gl.uniform2fv(u('uF3'), cur.f3);
+    gl.uniform3fv(u('uGrade'), cur.grade);
+    gl.uniform1f(u('uWob'), cur.wiggle);
+    gl.uniform2f(u('uLook'), look.x, look.y);
+    gl.uniform1f(u('uBlink'), blink);
+    gl.uniform1f(u('uFocal'), focal);
+  });
+  // tight glow at 1/4 res, wide glow at 1/8 res
+  const down = (src, dst, knee) => pass(P.bright, dst, u => {
+    tex(0, src, u('uTex')); gl.uniform2f(u('uTexel'), 1 / src.w, 1 / src.h); gl.uniform2f(u('uKnee'), ...knee);
+  });
+  const blur = (src, dst, dx, dy) => pass(P.blur, dst, u => {
+    tex(0, src, u('uTex')); gl.uniform2f(u('uDir'), dx / src.w, dy / src.h);
+  });
+  down(T.scene, T.a, [.5, .92]);
+  blur(T.a, T.b, 1, 0); blur(T.b, T.a, 0, 1);
+  down(T.a, T.c, [-1, 0]);
+  blur(T.c, T.d, 1.5, 0); blur(T.d, T.c, 0, 1.5);
+  blur(T.c, T.d, 2.5, 0); blur(T.d, T.c, 0, 2.5);
+  pass(P.comp, null, u => { tex(0, T.scene, u('uScene')); tex(1, T.a, u('uB1')); tex(2, T.c, u('uB2')); });
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
