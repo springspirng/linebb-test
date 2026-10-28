@@ -118,14 +118,20 @@ vec2 iSphere(vec3 ro, vec3 rd, vec3 c, float r) {
 
 const vec3 BC = vec3(0., 1.05, 0.);   // bounding sphere center (local), radius 2.5
 
+// closest near-miss of the last march(): distance/t ratio and where it happened, for edge anti-aliasing
+float gNearR = 1e9, gNearT = -1.;
+
 float march(vec3 ro, vec3 rd) {
+  gNearR = 1e9; gNearT = -1.;
   vec2 bb = iSphere(ro, rd, vec3(uB.x, uB.y, 0.) + BC, 2.5);
   if (bb.y < 0.) return -1.;
   float t = max(bb.x, 0.);
   for (int i = 0; i < MARCH_STEPS; i++) {
     float d = map(ro + rd * t);
     if (d < .001) return t;
-    t += d;
+    float r = d / t;
+    if (r < gNearR) { gNearR = r; gNearT = t; }
+    t += d * .85;
     if (t > bb.y) break;
   }
   return -1.;
@@ -254,6 +260,15 @@ void main() {
     col = mix(col, fc, smoothstep(-.02, .12, -rd.y));
   }
 
+  // soft silhouette: rays that just miss get partial body coverage (about 1.6 px wide)
+  float pw = 1.6 / (uRes.y * uFocal);
+  if (!hitBody && gNearT > 0. && gNearR < pw) {
+    float cov = 1. - gNearR / pw;
+    cov = cov * cov * (3. - 2. * cov);
+    col = mix(col, shade(ro + rd * gNearT, rd), cov);
+    face = gFace * cov;
+  }
+
   vec3 oc = vec3(uB.x, uB.y, 0.) + BC - ro;
   float dc = length(oc - rd * dot(oc, rd));
   col += vec3(.1, .55, .55) * exp(-max(dc - 1.3, 0.) * 2.) * (hitBody ? .0 : .15);
@@ -369,8 +384,8 @@ function resize() {
   const dpr = Math.min(window.devicePixelRatio || 1, isTouch ? 1.25 : 1.5) * renderScale;
   canvas.width = Math.round(innerWidth * dpr);
   canvas.height = Math.round(innerHeight * dpr);
-  const aspect = innerWidth / innerHeight;
-  focal = 2.5 * Math.min(1, aspect) * Math.min(1, .7 + .4 * aspect);   // tall phones zoom out a bit so the lobes stay on screen
+  // keep ~1.72 world units of half-width visible so the lobes never touch the screen edge on tall phones
+  focal = Math.min(2.5, 2.2 * innerWidth / innerHeight);
   if (T) Object.values(T).forEach(freeTarget);
   const w = canvas.width, h = canvas.height;
   const q = [Math.max(1, w >> 2), Math.max(1, h >> 2)], e = [Math.max(1, w >> 3), Math.max(1, h >> 3)];
